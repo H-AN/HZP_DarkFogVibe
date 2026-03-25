@@ -1,0 +1,6 @@
+.vs
+.gitattributes
+bin
+obj
+codex-obj/
+src/codex-obj/
