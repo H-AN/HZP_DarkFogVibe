@@ -1,0 +1,18 @@
+{
+  "DarkFog.ErrorServiceUnavailable": "DarkFog 服务当前不可用。",
+  "DarkFog.Admin.Usage": "用法: !{0} <玩家名|玩家ID|@me> <曝光值|reset>",
+  "DarkFog.Admin.InvalidExposure": "曝光值 '{0}' 无效。示例: !{1} 目标 0.45",
+  "DarkFog.Admin.SetSuccess": "已将 {0} (ID {1}) 的曝光设置为 {2}。",
+  "DarkFog.Admin.ResetSuccess": "已重置 {0} (ID {1}) 的自定义曝光。",
+  "DarkFog.Admin.ApplyFailed": "给 {0} (ID {1}) 应用曝光失败，请检查插件日志。",
+  "DarkFog.Hidden.PlayerOnly": "该指令只能由游戏内玩家使用。",
+  "DarkFog.Hidden.Usage": "用法: !{0} <曝光值|reset>",
+  "DarkFog.Hidden.InvalidExposure": "曝光值 '{0}' 无效。示例: !{1} 0.65",
+  "DarkFog.Hidden.SetSuccess": "你的曝光已设置为 {0}。",
+  "DarkFog.Hidden.ResetSuccess": "你的曝光已重置为职业默认配置值。",
+  "DarkFog.Hidden.ApplyFailed": "应用你的曝光失败，请检查插件日志。",
+  "DarkFog.Target.MePlayerOnly": "@me 只能由游戏内玩家使用。",
+  "DarkFog.Target.NoPlayersAvailable": "当前没有可用的有效玩家。",
+  "DarkFog.Target.MultipleMatches": "'{0}' 匹配到多个玩家: {1}",
+  "DarkFog.Target.NotFound": "未找到匹配 '{0}' 的玩家。"
+}

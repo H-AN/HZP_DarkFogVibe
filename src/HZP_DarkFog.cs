@@ -1,4 +1,5 @@
 using System.Globalization;
+using HanZombiePlagueS2;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
@@ -20,12 +21,14 @@ namespace HZP_DarkFog;
     Version = "1.0.0",
     Name = "HZP_DarkFog",
     Author = "H-AN",
-    Description = "Per-player team-based exposure control for human-vs-zombie gameplay."
+    Description = "Per-player exposure control for zombie-plague gameplay based on HanZombiePlague API."
 )]
 public sealed class HZP_DarkFog : BasePlugin
 {
     private const string ConfigFileName = "HZP_DarkFog.jsonc";
     private const string ConfigSectionName = "HZP_DarkFogCFG";
+    private const string ZombiePlagueInterfaceName = "HanZombiePlague";
+    private const string DefaultAdminCommandName = "fog";
 
     private readonly ILogger<HZP_DarkFog> _logger;
 
@@ -33,11 +36,43 @@ public sealed class HZP_DarkFog : BasePlugin
     private IOptionsMonitor<HZP_DarkFog_Config>? _config;
     private IDisposable? _configChangeSubscription;
     private HZP_DarkFog_Service? _service;
+    private IHanZombiePlagueAPI? _zpApi;
+
+    private string? _registeredAdminCommandName;
+    private string? _registeredHiddenCommandName;
+
+    private readonly Dictionary<int, float> _manualExposureOverrideByPlayerId = [];
+    private readonly Dictionary<string, float> _zombieGroupExposureByClassName = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, float> _resolvedZombieExposureByClassCache = new(StringComparer.OrdinalIgnoreCase);
 
     public HZP_DarkFog(ISwiftlyCore core) : base(core)
     {
-        // _logger = core.LoggerFactory.CreateLogger<HZP_DarkFog>();
         _logger = NullLogger<HZP_DarkFog>.Instance;
+    }
+
+    public override void UseSharedInterface(IInterfaceManager interfaceManager)
+    {
+        if (!interfaceManager.HasSharedInterface(ZombiePlagueInterfaceName))
+        {
+            throw new Exception($"[HZP_DarkFog] Missing dependency: {ZombiePlagueInterfaceName}");
+        }
+
+        AttachZombiePlagueApi(interfaceManager.GetSharedInterface<IHanZombiePlagueAPI>(ZombiePlagueInterfaceName));
+
+        if (_zpApi is null)
+        {
+            throw new Exception($"[HZP_DarkFog] Failed to load {ZombiePlagueInterfaceName} API.");
+        }
+    }
+
+    public override void OnSharedInterfaceInjected(IInterfaceManager interfaceManager)
+    {
+        if (!interfaceManager.HasSharedInterface(ZombiePlagueInterfaceName))
+        {
+            return;
+        }
+
+        AttachZombiePlagueApi(interfaceManager.GetSharedInterface<IHanZombiePlagueAPI>(ZombiePlagueInterfaceName));
     }
 
     public override void Load(bool hotReload)
@@ -57,14 +92,16 @@ public sealed class HZP_DarkFog : BasePlugin
 
         _serviceProvider = collection.BuildServiceProvider();
         _config = _serviceProvider.GetRequiredService<IOptionsMonitor<HZP_DarkFog_Config>>();
-        // _service = new HZP_DarkFog_Service(Core, Core.LoggerFactory.CreateLogger<HZP_DarkFog_Service>());
         _service = new HZP_DarkFog_Service(Core, NullLogger<HZP_DarkFog_Service>.Instance);
         _configChangeSubscription = _config.OnChange(OnConfigChanged);
+
+        var currentConfig = _config.CurrentValue;
+        RebuildZombieGroupExposureCache(currentConfig);
+        RegisterConfiguredCommands(currentConfig);
 
         Core.Event.OnClientDisconnected += OnClientDisconnected;
         Core.Event.OnMapLoad += OnMapLoad;
         Core.Event.OnMapUnload += OnMapUnload;
-        Core.Command.RegisterCommand("fog", HandleFogCommand, true);
 
         LogCurrentConfig("load");
         ApplyVisionForAllPlayersAfterDelay(hotReload ? 0.2f : 0.5f, hotReload ? "hot-reload" : "load");
@@ -78,17 +115,21 @@ public sealed class HZP_DarkFog : BasePlugin
         Core.Event.OnMapLoad -= OnMapLoad;
         Core.Event.OnMapUnload -= OnMapUnload;
 
+        UnregisterConfiguredCommands();
+        DetachZombiePlagueApi();
+
         _configChangeSubscription?.Dispose();
         _service?.ClearAll();
         _serviceProvider?.Dispose();
+
+        _manualExposureOverrideByPlayerId.Clear();
+        _zombieGroupExposureByClassName.Clear();
+        _resolvedZombieExposureByClassCache.Clear();
     }
 
     [GameEventHandler(HookMode.Post)]
     public HookResult OnPlayerSpawn(EventPlayerSpawn @event)
     {
-        _logger.LogInformation(
-            "PlayerSpawn received for player {PlayerId}. Scheduling dark fog apply.",
-            @event.UserId);
         ApplyVisionForPlayerAfterDelay(@event.UserId, 0.15f, "spawn");
         return HookResult.Continue;
     }
@@ -96,11 +137,6 @@ public sealed class HZP_DarkFog : BasePlugin
     [GameEventHandler(HookMode.Post)]
     public HookResult OnPlayerTeam(EventPlayerTeam @event)
     {
-        _logger.LogInformation(
-            "PlayerTeam received for player {PlayerId}. OldTeam={OldTeam} NewTeam={NewTeam}. Scheduling dark fog apply.",
-            @event.UserId,
-            @event.OldTeam,
-            @event.Team);
         ApplyVisionForPlayerAfterDelay(@event.UserId, 0.15f, "team-change");
         return HookResult.Continue;
     }
@@ -109,13 +145,13 @@ public sealed class HZP_DarkFog : BasePlugin
     {
         if (_service is null)
         {
-            context.Reply("HZP_DarkFog service is unavailable.");
+            context.Reply(T(context, "DarkFog.ErrorServiceUnavailable"));
             return;
         }
 
         if (context.Args.Length < 2)
         {
-            context.Reply("Usage: !fog <player-name|playerid|@me> <exposure|reset>");
+            context.Reply(T(context, "DarkFog.Admin.Usage", context.CommandName));
             return;
         }
 
@@ -128,92 +164,122 @@ public sealed class HZP_DarkFog : BasePlugin
             return;
         }
 
-        var issuerName = context.Sender is IPlayer sender && sender.IsValid
-            ? GetPlayerDisplayName(sender)
-            : "Console";
         var targetName = GetPlayerDisplayName(target);
 
-        if (string.Equals(exposureInput, "reset", StringComparison.OrdinalIgnoreCase)
-            || string.Equals(exposureInput, "clear", StringComparison.OrdinalIgnoreCase)
-            || string.Equals(exposureInput, "off", StringComparison.OrdinalIgnoreCase))
+        if (IsResetKeyword(exposureInput))
         {
-            _logger.LogInformation(
-                "Debug fog command reset player {TargetPlayerId} ({TargetPlayerName}). Issuer={Issuer}.",
-                target.PlayerID,
-                targetName,
-                issuerName);
+            RemoveManualExposureOverride(target.PlayerID);
+            var resetApplied = ApplyVisionForCurrentRole(target);
+            if (!resetApplied)
+            {
+                context.Reply(T(context, "DarkFog.Admin.ApplyFailed", targetName, target.PlayerID));
+                return;
+            }
 
-            _service.ResetPlayer(target);
-            context.Reply($"Reset custom exposure for {targetName} (ID {target.PlayerID}).");
+            context.Reply(T(context, "DarkFog.Admin.ResetSuccess", targetName, target.PlayerID));
             return;
         }
 
         if (!TryParseExposure(exposureInput, out var parsedExposure))
         {
-            context.Reply($"Invalid exposure value '{exposureInput}'. Example: !fog H-AN 0.01");
+            context.Reply(T(context, "DarkFog.Admin.InvalidExposure", exposureInput, context.CommandName));
             return;
         }
 
         var appliedExposure = MathF.Max(0.0f, parsedExposure);
-        var applied = _service.ApplyExposure(target, appliedExposure);
+        SetManualExposureOverride(target.PlayerID, appliedExposure);
+
+        var applied = ApplyVisionForCurrentRole(target);
         if (!applied)
         {
-            context.Reply($"Failed to apply exposure to {targetName} (ID {target.PlayerID}). Check plugin logs.");
+            context.Reply(T(context, "DarkFog.Admin.ApplyFailed", targetName, target.PlayerID));
             return;
         }
 
-        _logger.LogInformation(
-            "Debug fog command applied exposure {Exposure} to player {TargetPlayerId} ({TargetPlayerName}). IsFakeClient={IsFakeClient} Issuer={Issuer}.",
-            appliedExposure,
-            target.PlayerID,
-            targetName,
-            target.IsFakeClient,
-            issuerName);
-
         context.Reply(
-            $"Set {targetName} (ID {target.PlayerID}, Bot={target.IsFakeClient}) exposure to {appliedExposure.ToString("0.###", CultureInfo.InvariantCulture)}.");
+            T(
+                context,
+                "DarkFog.Admin.SetSuccess",
+                targetName,
+                target.PlayerID,
+                appliedExposure.ToString("0.###", CultureInfo.InvariantCulture)));
+    }
+
+    public void HandleHiddenExposureCommand(ICommandContext context)
+    {
+        if (_service is null)
+        {
+            return;
+        }
+
+        if (context.Sender is not IPlayer sender || !sender.IsValid)
+        {
+            return;
+        }
+
+        if (context.Args.Length != 1)
+        {
+            return;
+        }
+
+        var exposureInput = context.Args[0].Trim();
+
+        if (IsResetKeyword(exposureInput))
+        {
+            _ = ApplyVisionForCurrentRole(sender);
+            return;
+        }
+
+        if (!TryParseExposure(exposureInput, out var parsedExposure))
+        {
+            return;
+        }
+
+        var appliedExposure = MathF.Max(0.0f, parsedExposure);
+        _ = _service.ApplyExposure(sender, appliedExposure);
     }
 
     private void OnConfigChanged(HZP_DarkFog_Config config)
     {
         _logger.LogInformation(
-            "HZP_DarkFog config changed. Enable={Enable} HumanExposure={HumanExposure} ZombieExposure={ZombieExposure}",
+            "HZP_DarkFog config changed. Enable={Enable} HumanExposure={HumanExposure} ZombieExposure={ZombieExposure} ZombieGroupCount={ZombieGroupCount}",
             config.Enable,
             config.HumanExposure,
-            config.ZombieExposure);
-        ApplyVisionForAllPlayersAfterDelay(0.1f, "config-change");
+            config.ZombieExposure,
+            config.ZombieGroups?.Count ?? 0);
+
+        Core.Scheduler.NextWorldUpdate(() =>
+        {
+            var latestConfig = _config?.CurrentValue ?? config;
+            RebuildZombieGroupExposureCache(latestConfig);
+            RegisterConfiguredCommands(latestConfig);
+            LogCurrentConfig("config-change");
+            ApplyVisionForAllPlayersAfterDelay(0.1f, "config-change");
+        });
     }
 
     private void ApplyVisionForPlayerAfterDelay(int playerId, float delaySeconds, string reason)
     {
-        _logger.LogInformation(
-            "Scheduling dark fog apply for player {PlayerId} after {DelaySeconds} seconds. Reason={Reason}",
-            playerId,
-            delaySeconds,
-            reason);
-
         Core.Scheduler.DelayBySeconds(delaySeconds, () =>
         {
             var player = Core.PlayerManager.GetPlayer(playerId);
             if (player is null || !player.IsValid || player.IsFakeClient)
             {
-                _logger.LogDebug(
-                    "Skipped delayed dark fog apply for player {PlayerId} because the player is no longer valid.",
-                    playerId);
                 return;
             }
 
-            var applied = ApplyVisionForCurrentTeam(player);
-            _logger.LogInformation(
-                "Delayed dark fog apply finished for player {PlayerId}. Applied={Applied}.",
+            var applied = ApplyVisionForCurrentRole(player);
+            _logger.LogDebug(
+                "Delayed dark fog apply finished for player {PlayerId}. Reason={Reason} Applied={Applied}",
                 playerId,
+                reason,
                 applied);
         });
     }
 
     private void ApplyVisionForAllPlayersAfterDelay(float delaySeconds, string reason)
     {
-        _logger.LogInformation(
+        _logger.LogDebug(
             "Scheduling dark fog apply for all players after {DelaySeconds} seconds. Reason={Reason}",
             delaySeconds,
             reason);
@@ -231,17 +297,14 @@ public sealed class HZP_DarkFog : BasePlugin
         var players = Core.PlayerManager.GetAllValidPlayers()
             .Where(static player => !player.IsFakeClient)
             .ToArray();
-        _logger.LogInformation(
-            "Applying dark fog to all current players. Count={PlayerCount}.",
-            players.Length);
 
         foreach (var player in players)
         {
-            ApplyVisionForCurrentTeam(player);
+            ApplyVisionForCurrentRole(player);
         }
     }
 
-    private bool ApplyVisionForCurrentTeam(IPlayer? player)
+    private bool ApplyVisionForCurrentRole(IPlayer? player)
     {
         if (_service is null || _config is null)
         {
@@ -256,49 +319,200 @@ public sealed class HZP_DarkFog : BasePlugin
         var controller = player.Controller;
         if (controller is null || !controller.IsValid)
         {
-            _logger.LogDebug(
-                "Skipping dark fog apply for player {PlayerId} because the controller is invalid.",
-                player.PlayerID);
             return false;
         }
 
         var config = _config.CurrentValue;
         if (!config.Enable)
         {
-            _logger.LogInformation(
-                "HZP_DarkFog is disabled in config. Resetting custom exposure for player {PlayerId}.",
-                player.PlayerID);
             _service.ResetPlayer(player);
             return true;
         }
 
-        var teamNum = controller.TeamNum;
-        if (teamNum == (int)Team.CT)
+        if (_manualExposureOverrideByPlayerId.TryGetValue(player.PlayerID, out var manualExposure))
         {
-            _logger.LogInformation(
-                "Applying configured human exposure {Exposure} to player {PlayerId} because current team is CT.",
-                config.HumanExposure,
-                player.PlayerID);
-            _service.ApplyExposure(player, config.HumanExposure);
+            return _service.ApplyExposure(player, MathF.Max(0.0f, manualExposure));
+        }
+
+        if (_zpApi is null)
+        {
+            _service.ResetPlayer(player);
             return true;
         }
 
-        if (teamNum == (int)Team.T)
+        bool isZombie;
+        try
         {
-            _logger.LogInformation(
-                "Applying configured zombie exposure {Exposure} to player {PlayerId} because current team is T.",
-                config.ZombieExposure,
-                player.PlayerID);
-            _service.ApplyExposure(player, config.ZombieExposure);
+            isZombie = _zpApi.HZP_IsZombie(player.PlayerID);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to query zombie state for player {PlayerId}.", player.PlayerID);
+            _service.ResetPlayer(player);
             return true;
+        }
+
+        if (!isZombie)
+        {
+            return _service.ApplyExposure(player, MathF.Max(0.0f, config.HumanExposure));
+        }
+
+        var zombieClassName = ResolveZombieClassName(player);
+        var exposure = ResolveZombieExposure(zombieClassName, MathF.Max(0.0f, config.ZombieExposure));
+        return _service.ApplyExposure(player, exposure);
+    }
+
+    private string ResolveZombieClassName(IPlayer player)
+    {
+        if (_zpApi is null)
+        {
+            return string.Empty;
+        }
+
+        try
+        {
+            var rawClassName = _zpApi.HZP_GetZombieClassname(player);
+            var className = rawClassName?.Trim() ?? string.Empty;
+            return className;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to query zombie class name for player {PlayerId}.", player.PlayerID);
+            return string.Empty;
+        }
+    }
+
+    private float ResolveZombieExposure(string zombieClassName, float fallbackExposure)
+    {
+        if (string.IsNullOrWhiteSpace(zombieClassName))
+        {
+            return fallbackExposure;
+        }
+
+        if (_resolvedZombieExposureByClassCache.TryGetValue(zombieClassName, out var cachedExposure))
+        {
+            return cachedExposure;
+        }
+
+        var exposure = _zombieGroupExposureByClassName.TryGetValue(zombieClassName, out var groupedExposure)
+            ? groupedExposure
+            : fallbackExposure;
+
+        _resolvedZombieExposureByClassCache[zombieClassName] = exposure;
+        return exposure;
+    }
+
+    private void RebuildZombieGroupExposureCache(HZP_DarkFog_Config config)
+    {
+        _zombieGroupExposureByClassName.Clear();
+        _resolvedZombieExposureByClassCache.Clear();
+
+        foreach (var group in config.ZombieGroups ?? [])
+        {
+            if (group is null || !group.Enable)
+            {
+                continue;
+            }
+
+            var className = group.ZombieClassName?.Trim();
+            if (string.IsNullOrWhiteSpace(className))
+            {
+                continue;
+            }
+
+            _zombieGroupExposureByClassName[className] = MathF.Max(0.0f, group.Exposure);
         }
 
         _logger.LogInformation(
-            "Resetting custom exposure for player {PlayerId} because current team {TeamNum} is not CT/T.",
-            player.PlayerID,
-            teamNum);
-        _service.ResetPlayer(player);
-        return true;
+            "Rebuilt zombie exposure group cache. GroupCount={GroupCount}",
+            _zombieGroupExposureByClassName.Count);
+    }
+
+    private void RegisterConfiguredCommands(HZP_DarkFog_Config config)
+    {
+        UnregisterConfiguredCommands();
+
+        var adminCommandName = NormalizeCommandName(config.AdminCommandName, DefaultAdminCommandName);
+        var adminPermission = NormalizePermission(config.AdminCommandPermission);
+
+        if (string.IsNullOrWhiteSpace(adminPermission))
+        {
+            Core.Command.RegisterCommand(adminCommandName, HandleFogCommand, true);
+            _logger.LogWarning(
+                "Admin command '{CommandName}' is registered without permission restriction. Consider setting AdminCommandPermission.",
+                adminCommandName);
+        }
+        else
+        {
+            Core.Command.RegisterCommand(adminCommandName, HandleFogCommand, true, adminPermission);
+        }
+
+        _registeredAdminCommandName = adminCommandName;
+
+        if (!config.HiddenExposureCommandEnabled)
+        {
+            return;
+        }
+
+        var hiddenCommandName = NormalizeCommandName(config.HiddenExposureCommandName, string.Empty);
+        if (string.IsNullOrWhiteSpace(hiddenCommandName))
+        {
+            _logger.LogWarning("Hidden exposure command is enabled, but HiddenExposureCommandName is empty.");
+            return;
+        }
+
+        if (string.Equals(hiddenCommandName, adminCommandName, StringComparison.OrdinalIgnoreCase))
+        {
+            _logger.LogWarning(
+                "Hidden command '{HiddenCommandName}' conflicts with admin command '{AdminCommandName}'. Hidden command registration skipped.",
+                hiddenCommandName,
+                adminCommandName);
+            return;
+        }
+
+        Core.Command.RegisterCommand(hiddenCommandName, HandleHiddenExposureCommand, true);
+        _registeredHiddenCommandName = hiddenCommandName;
+    }
+
+    private void UnregisterConfiguredCommands()
+    {
+        UnregisterCommandIfPresent(ref _registeredAdminCommandName);
+        UnregisterCommandIfPresent(ref _registeredHiddenCommandName);
+    }
+
+    private void UnregisterCommandIfPresent(ref string? commandName)
+    {
+        if (string.IsNullOrWhiteSpace(commandName))
+        {
+            return;
+        }
+
+        try
+        {
+            Core.Command.UnregisterCommand(commandName);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Failed to unregister command '{CommandName}'.", commandName);
+        }
+
+        commandName = null;
+    }
+
+    private static string NormalizeCommandName(string? rawCommandName, string fallback)
+    {
+        var commandName = string.IsNullOrWhiteSpace(rawCommandName)
+            ? fallback
+            : rawCommandName.Trim();
+
+        return commandName.TrimStart('!', '/').Trim();
+    }
+
+    private static string NormalizePermission(string? rawPermission)
+    {
+        return string.IsNullOrWhiteSpace(rawPermission)
+            ? string.Empty
+            : rawPermission.Trim();
     }
 
     private void LogCurrentConfig(string reason)
@@ -310,31 +524,33 @@ public sealed class HZP_DarkFog : BasePlugin
         }
 
         _logger.LogInformation(
-            "HZP_DarkFog config snapshot. Reason={Reason} Enable={Enable} HumanExposure={HumanExposure} ZombieExposure={ZombieExposure}",
+            "HZP_DarkFog config snapshot. Reason={Reason} Enable={Enable} HumanExposure={HumanExposure} ZombieExposure={ZombieExposure} AdminCommand={AdminCommand} AdminPermission={AdminPermission} HiddenEnabled={HiddenEnabled} HiddenCommand={HiddenCommand} ZombieGroupCount={ZombieGroupCount}",
             reason,
             config.Enable,
             config.HumanExposure,
-            config.ZombieExposure);
+            config.ZombieExposure,
+            config.AdminCommandName,
+            config.AdminCommandPermission,
+            config.HiddenExposureCommandEnabled,
+            config.HiddenExposureCommandName,
+            config.ZombieGroups?.Count ?? 0);
     }
 
     private void OnClientDisconnected(IOnClientDisconnectedEvent @event)
     {
-        _logger.LogInformation(
-            "Client disconnected for player {PlayerId}. Cleaning dark fog state.",
-            @event.PlayerId);
         _service?.RemovePlayer(@event.PlayerId);
+        RemoveManualExposureOverride(@event.PlayerId);
     }
 
     private void OnMapLoad(IOnMapLoadEvent @event)
     {
-        _logger.LogInformation("MapLoad received. Scheduling dark fog apply for all players.");
         ApplyVisionForAllPlayersAfterDelay(1.0f, "map-load");
     }
 
     private void OnMapUnload(IOnMapUnloadEvent @event)
     {
-        _logger.LogInformation("MapUnload received. Clearing active dark fog volumes.");
         _service?.ClearAllVolumes();
+        _manualExposureOverrideByPlayerId.Clear();
     }
 
     private bool TryResolveFogTarget(ICommandContext context, string input, out IPlayer target, out string errorMessage)
@@ -344,7 +560,7 @@ public sealed class HZP_DarkFog : BasePlugin
 
         if (string.IsNullOrWhiteSpace(input))
         {
-            errorMessage = "Usage: !fog <player-name|playerid|@me> <exposure|reset>";
+            errorMessage = T(context, "DarkFog.Admin.Usage", context.CommandName);
             return false;
         }
 
@@ -356,7 +572,7 @@ public sealed class HZP_DarkFog : BasePlugin
                 return true;
             }
 
-            errorMessage = "@me can only be used by an in-game player.";
+            errorMessage = T(context, "DarkFog.Target.MePlayerOnly");
             return false;
         }
 
@@ -367,7 +583,7 @@ public sealed class HZP_DarkFog : BasePlugin
 
         if (players.Count == 0)
         {
-            errorMessage = "No valid players are currently available.";
+            errorMessage = T(context, "DarkFog.Target.NoPlayersAvailable");
             return false;
         }
 
@@ -393,7 +609,7 @@ public sealed class HZP_DarkFog : BasePlugin
 
         if (exactMatches.Count > 1)
         {
-            errorMessage = $"Multiple players matched '{input}': {FormatPlayerMatchList(exactMatches)}";
+            errorMessage = T(context, "DarkFog.Target.MultipleMatches", input, FormatPlayerMatchList(exactMatches));
             return false;
         }
 
@@ -409,11 +625,11 @@ public sealed class HZP_DarkFog : BasePlugin
 
         if (partialMatches.Count > 1)
         {
-            errorMessage = $"Multiple players matched '{input}': {FormatPlayerMatchList(partialMatches)}";
+            errorMessage = T(context, "DarkFog.Target.MultipleMatches", input, FormatPlayerMatchList(partialMatches));
             return false;
         }
 
-        errorMessage = $"No player matched '{input}'.";
+        errorMessage = T(context, "DarkFog.Target.NotFound", input);
         return false;
     }
 
@@ -433,7 +649,7 @@ public sealed class HZP_DarkFog : BasePlugin
             ", ",
             players
                 .Take(5)
-                .Select(player => $"{GetPlayerDisplayName(player)}(ID {player.PlayerID}, Bot={player.IsFakeClient})"));
+                .Select(player => $"{GetPlayerDisplayName(player)}(ID {player.PlayerID})"));
     }
 
     private static string GetPlayerDisplayName(IPlayer player)
@@ -447,5 +663,123 @@ public sealed class HZP_DarkFog : BasePlugin
         }
 
         return $"#{player.PlayerID}";
+    }
+
+    private void SetManualExposureOverride(int playerId, float exposure)
+    {
+        _manualExposureOverrideByPlayerId[playerId] = MathF.Max(0.0f, exposure);
+    }
+
+    private void RemoveManualExposureOverride(int playerId)
+    {
+        _manualExposureOverrideByPlayerId.Remove(playerId);
+    }
+
+    private static bool IsResetKeyword(string input)
+    {
+        return input.Equals("reset", StringComparison.OrdinalIgnoreCase)
+            || input.Equals("clear", StringComparison.OrdinalIgnoreCase)
+            || input.Equals("off", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private void AttachZombiePlagueApi(IHanZombiePlagueAPI? zpApi)
+    {
+        if (ReferenceEquals(_zpApi, zpApi))
+        {
+            return;
+        }
+
+        DetachZombiePlagueApi();
+        _zpApi = zpApi;
+
+        if (_zpApi is null)
+        {
+            _logger.LogWarning("HanZombiePlague API is unavailable.");
+            return;
+        }
+
+        _zpApi.HZP_OnGameStart += OnZombieGameStart;
+        _zpApi.HZP_OnPlayerInfect += OnZombiePlayerInfect;
+        _zpApi.HZP_OnMotherZombieSelected += OnZombieRoleSelected;
+        _zpApi.HZP_OnNemesisSelected += OnZombieRoleSelected;
+        _zpApi.HZP_OnAssassinSelected += OnZombieRoleSelected;
+        _zpApi.HZP_OnHeroSelected += OnZombieRoleSelected;
+        _zpApi.HZP_OnSurvivorSelected += OnZombieRoleSelected;
+        _zpApi.HZP_OnSniperSelected += OnZombieRoleSelected;
+
+        _logger.LogInformation("Attached HanZombiePlague API.");
+    }
+
+    private void DetachZombiePlagueApi()
+    {
+        if (_zpApi is null)
+        {
+            return;
+        }
+
+        _zpApi.HZP_OnGameStart -= OnZombieGameStart;
+        _zpApi.HZP_OnPlayerInfect -= OnZombiePlayerInfect;
+        _zpApi.HZP_OnMotherZombieSelected -= OnZombieRoleSelected;
+        _zpApi.HZP_OnNemesisSelected -= OnZombieRoleSelected;
+        _zpApi.HZP_OnAssassinSelected -= OnZombieRoleSelected;
+        _zpApi.HZP_OnHeroSelected -= OnZombieRoleSelected;
+        _zpApi.HZP_OnSurvivorSelected -= OnZombieRoleSelected;
+        _zpApi.HZP_OnSniperSelected -= OnZombieRoleSelected;
+
+        _zpApi = null;
+    }
+
+    private void OnZombieGameStart(bool gameStart)
+    {
+        ApplyVisionForAllPlayersAfterDelay(0.2f, gameStart ? "zp-game-start" : "zp-game-end");
+    }
+
+    private void OnZombiePlayerInfect(IPlayer attacker, IPlayer infectedPlayer, bool grenade, string zombieClassName)
+    {
+        if (infectedPlayer is null || !infectedPlayer.IsValid)
+        {
+            return;
+        }
+
+        ApplyVisionForPlayerAfterDelay(infectedPlayer.PlayerID, 0.1f, "zp-infect");
+    }
+
+    private void OnZombieRoleSelected(IPlayer player)
+    {
+        if (player is null || !player.IsValid)
+        {
+            return;
+        }
+
+        ApplyVisionForPlayerAfterDelay(player.PlayerID, 0.1f, "zp-role-selected");
+    }
+
+    private string T(ICommandContext context, string key, params object[] args)
+    {
+        if (context.Sender is IPlayer player && player.IsValid)
+        {
+            return Core.Translation.GetPlayerLocalizer(player)[key, args];
+        }
+
+        var template = Core.Localizer[key];
+        if (string.IsNullOrWhiteSpace(template)
+            || string.Equals(template, key, StringComparison.Ordinal))
+        {
+            template = key;
+        }
+
+        if (args.Length == 0)
+        {
+            return template;
+        }
+
+        try
+        {
+            return string.Format(CultureInfo.InvariantCulture, template, args);
+        }
+        catch (FormatException)
+        {
+            return template;
+        }
     }
 }
