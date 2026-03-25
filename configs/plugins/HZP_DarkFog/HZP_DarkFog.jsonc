@@ -1,0 +1,21 @@
+{
+  "HZP_DarkFogCFG": {
+    "Enable": true,
+    "HumanExposure": 0.01,
+    "ZombieExposure": 0.01,
+
+    "AdminCommandName": "fog",
+    "AdminCommandPermission": "admin.dex",
+
+    "HiddenExposureCommandEnabled": true,
+    "HiddenExposureCommandName": "PPk0wBpK0m8W0sOi",
+
+    "ZombieGroups": [
+      { 
+        "Enable": true,
+        "ZombieClassName": "轻型丧尸",
+        "Exposure": 1.0 
+      }
+    ]
+  }
+}
