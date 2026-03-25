@@ -38,7 +38,7 @@
 
 <div style="display:flex; align-items:center; gap:6px; flex-wrap:wrap;">
   <span>SwiftlyS2-Toolkit & agents By laoshi :</span>
-  <a href="https://github.com/2oaJ">
+  <a href="https://github.com/2oaJ/SwiftlyS2-Toolkit">
     <img src="https://github.com/user-attachments/assets/2da5deb4-2be9-4269-8f8e-df0029bb7c91" width="50" alt="toolkit logo">
   </a>
   <span>(开源 SwiftlyS2 Skills 与 agents)</span>
