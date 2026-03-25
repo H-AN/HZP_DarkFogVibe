@@ -181,22 +181,25 @@ Current version treats HanZombiePlague as a hard dependency and throws if missin
 {
   "HZP_DarkFogCFG": {
     "Enable": true,
-    "HumanExposure": 0.45,
-    "ZombieExposure": 1.25,
+    "HumanExposure": 0.01,
+    "ZombieExposure": 0.01,
 
     "AdminCommandName": "fog",
-    "AdminCommandPermission": "hzp.darkfog.admin",
+    "AdminCommandPermission": "admin.dex",
 
     "HiddenExposureCommandEnabled": true,
-    "HiddenExposureCommandName": "hauhdahsdasd",
+    "HiddenExposureCommandName": "PPk0wBpK0m8W0sOi",
 
     "ZombieGroups": [
-      { "Enable": true, "ZombieClassName": "nemesis", "Exposure": 0.20 },
-      { "Enable": true, "ZombieClassName": "assassin", "Exposure": 0.35 },
-      { "Enable": true, "ZombieClassName": "mother", "Exposure": 0.60 }
+      { 
+        "Enable": true,
+        "ZombieClassName": "轻型丧尸",
+        "Exposure": 1.0 
+      }
     ]
   }
 }
+
 ```
 
 ## Installation
