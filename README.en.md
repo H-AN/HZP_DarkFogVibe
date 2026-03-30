@@ -29,14 +29,6 @@ Designed for production zombie servers, with support for:
 ## Credit :
 
 <div style="display:flex; align-items:center; gap:6px; flex-wrap:wrap;">
-  <span>Powered by yumiai :</span>
-  <a href="https://yumi.chat:3000/">
-    <img src="https://yumi.chat:3000/logo.png" width="50" alt="yumiai logo">
-  </a>
-  <span>(AI model provider)</span>
-</div>
-
-<div style="display:flex; align-items:center; gap:6px; flex-wrap:wrap;">
   <span>SwiftlyS2-Toolkit & agents By laoshi :</span>
   <a href="https://github.com/2oaJ/SwiftlyS2-Toolkit">
     <img src="https://github.com/user-attachments/assets/2da5deb4-2be9-4269-8f8e-df0029bb7c91" width="50" alt="toolkit logo">
