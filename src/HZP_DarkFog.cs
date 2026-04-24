@@ -18,7 +18,7 @@ namespace HZP_DarkFog;
 
 [PluginMetadata(
     Id = "HZP_DarkFog",
-    Version = "1.0.0",
+    Version = "1.1.0",
     Name = "HZP_DarkFog",
     Author = "H-AN",
     Description = "Per-player exposure control for zombie-plague gameplay based on HanZombiePlague API."
@@ -449,29 +449,28 @@ public sealed class HZP_DarkFog : BasePlugin
 
         _registeredAdminCommandName = adminCommandName;
 
-        if (!config.HiddenExposureCommandEnabled)
+        var hiddenCommandName = string.Empty;
+        if (config.HiddenExposureCommandEnabled)
         {
-            return;
+            hiddenCommandName = NormalizeCommandName(config.HiddenExposureCommandName, string.Empty);
+            if (string.IsNullOrWhiteSpace(hiddenCommandName))
+            {
+                _logger.LogWarning("Hidden exposure command is enabled, but HiddenExposureCommandName is empty.");
+            }
+            else if (string.Equals(hiddenCommandName, adminCommandName, StringComparison.OrdinalIgnoreCase))
+            {
+                _logger.LogWarning(
+                    "Hidden command '{HiddenCommandName}' conflicts with admin command '{AdminCommandName}'. Hidden command registration skipped.",
+                    hiddenCommandName,
+                    adminCommandName);
+            }
+            else
+            {
+                Core.Command.RegisterCommand(hiddenCommandName, HandleHiddenExposureCommand, true);
+                _registeredHiddenCommandName = hiddenCommandName;
+            }
         }
 
-        var hiddenCommandName = NormalizeCommandName(config.HiddenExposureCommandName, string.Empty);
-        if (string.IsNullOrWhiteSpace(hiddenCommandName))
-        {
-            _logger.LogWarning("Hidden exposure command is enabled, but HiddenExposureCommandName is empty.");
-            return;
-        }
-
-        if (string.Equals(hiddenCommandName, adminCommandName, StringComparison.OrdinalIgnoreCase))
-        {
-            _logger.LogWarning(
-                "Hidden command '{HiddenCommandName}' conflicts with admin command '{AdminCommandName}'. Hidden command registration skipped.",
-                hiddenCommandName,
-                adminCommandName);
-            return;
-        }
-
-        Core.Command.RegisterCommand(hiddenCommandName, HandleHiddenExposureCommand, true);
-        _registeredHiddenCommandName = hiddenCommandName;
     }
 
     private void UnregisterConfiguredCommands()
@@ -498,7 +497,6 @@ public sealed class HZP_DarkFog : BasePlugin
 
         commandName = null;
     }
-
     private static string NormalizeCommandName(string? rawCommandName, string fallback)
     {
         var commandName = string.IsNullOrWhiteSpace(rawCommandName)

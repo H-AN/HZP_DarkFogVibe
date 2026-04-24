@@ -1,6 +1,8 @@
+using System.Runtime.InteropServices;
 using System.Reflection;
 using Microsoft.Extensions.Logging;
 using SwiftlyS2.Shared;
+using SwiftlyS2.Shared.Memory;
 using SwiftlyS2.Shared.Natives;
 using SwiftlyS2.Shared.Players;
 using SwiftlyS2.Shared.SchemaDefinitions;
@@ -11,14 +13,29 @@ public sealed class HZP_DarkFog_Service
 {
     private const string PostProcessDesignerName = "post_processing_volume";
 
+    private delegate void SnapViewAnglesDelegate(nint pawn, nint angle);
+
     private readonly ISwiftlyCore _core;
     private readonly ILogger<HZP_DarkFog_Service> _logger;
     private readonly Dictionary<int, uint> _volumeEntityIndexByPlayerId = [];
+    private readonly IUnmanagedFunction<SnapViewAnglesDelegate>? _snapViewAngles;
 
     public HZP_DarkFog_Service(ISwiftlyCore core, ILogger<HZP_DarkFog_Service> logger)
     {
         _core = core;
         _logger = logger;
+
+        var snapViewAnglesAddress = _core.GameData.GetSignature("SnapViewAngles");
+        if (snapViewAnglesAddress == nint.Zero)
+        {
+            _logger.LogWarning("SnapViewAngles signature was not found. Refresh will skip angle snapping.");
+            return;
+        }
+
+        _snapViewAngles =
+            _core.Memory.GetUnmanagedFunctionByAddress<SnapViewAnglesDelegate>(snapViewAnglesAddress);
+
+        _logger.LogInformation("SnapViewAngles signature loaded at 0x{Address:X}.", snapViewAnglesAddress);
     }
 
     public bool ApplyExposure(IPlayer? player, float exposure)
@@ -213,29 +230,72 @@ public sealed class HZP_DarkFog_Service
             return;
         }
 
+        var playerId = validPlayer.PlayerID;
         _logger.LogInformation(
-            "Refreshing visuals for player {PlayerId}.",
-            validPlayer.PlayerID);
+            "Scheduling visual refresh for player {PlayerId} on next world update.",
+            playerId);
 
-        if (TryForceFullUpdate(validPlayer))
+        _core.Scheduler.NextWorldUpdate(() =>
+        {
+            var scheduledPlayer = _core.PlayerManager.GetPlayer(playerId);
+            if (!TryGetExposureTarget(scheduledPlayer, out var refreshedPlayer))
+            {
+                return;
+            }
+
+            _logger.LogInformation(
+                "Refreshing visuals for player {PlayerId} on next world update.",
+                refreshedPlayer.PlayerID);
+
+            TrySnapViewRefresh(refreshedPlayer);
+
+            if (TryForceFullUpdate(refreshedPlayer))
+            {
+                return;
+            }
+
+            _logger.LogWarning(
+                "ForceFullUpdate was unavailable for player {PlayerId}; skipped unsafe Teleport fallback to avoid model tilt.",
+                refreshedPlayer.PlayerID);
+        });
+    }
+
+    private void TrySnapViewRefresh(IPlayer player)
+    {
+        if (_snapViewAngles is null)
         {
             return;
         }
 
         try
         {
-            var eyeAngles = validPlayer.PlayerPawn?.EyeAngles;
-            validPlayer.Teleport(null, eyeAngles, null);
-            _logger.LogInformation(
-                "ForceFullUpdate was unavailable for player {PlayerId}; used Teleport refresh fallback.",
-                validPlayer.PlayerID);
+            var pawn = player.PlayerPawn;
+            if (pawn is null || !pawn.IsValid)
+            {
+                return;
+            }
+
+            var eyeAngles = pawn.EyeAngles;
+            var angleMemory = Marshal.AllocHGlobal(Marshal.SizeOf<QAngle>());
+
+            try
+            {
+                Marshal.StructureToPtr(eyeAngles, angleMemory, false);
+                _snapViewAngles.Call(pawn.Address, angleMemory);
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(angleMemory);
+            }
+
+            _logger.LogInformation("Applied SnapViewAngles refresh for player {PlayerId}.", player.PlayerID);
         }
         catch (Exception ex)
         {
             _logger.LogDebug(
                 ex,
-                "Fallback visual refresh failed for player {PlayerId}.",
-                validPlayer.PlayerID);
+                "SnapViewAngles refresh failed for player {PlayerId}.",
+                player.PlayerID);
         }
     }
 
@@ -243,6 +303,16 @@ public sealed class HZP_DarkFog_Service
     {
         try
         {
+            var serverSideClient = player.ServerSideClient;
+            if (serverSideClient is not null)
+            {
+                serverSideClient.ForceFullUpdate();
+                _logger.LogInformation(
+                    "ForceFullUpdate succeeded on ServerSideClient for player {PlayerId}.",
+                    player.PlayerID);
+                return true;
+            }
+
             if (TryInvokeForceFullUpdate(player))
             {
                 _logger.LogInformation(
